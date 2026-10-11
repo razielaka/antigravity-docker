@@ -108,8 +108,11 @@ test('Security - HTTP Proxy Gateway & Status Endpoint (SEC-06, SEC-07, SEC-10, S
             const res = await makeRequest('/status');
             assert.ok(res.headers['content-security-policy']);
             assert.ok(res.headers['content-security-policy'].includes("default-src 'self'"));
+            assert.ok(res.headers['content-security-policy'].includes("media-src 'self' blob: data:"));
+            assert.ok(res.headers['content-security-policy'].includes("https://*.gstatic.com"));
             assert.equal(res.headers['x-content-type-options'], 'nosniff');
             assert.equal(res.headers['x-frame-options'], 'SAMEORIGIN');
+            assert.equal(res.headers['permissions-policy'], 'camera=(), microphone=(self), geolocation=()');
         });
 
         await t.test('/status JSON format does not leak internal ports, instance name, or errors (SEC-10)', async () => {

@@ -6,6 +6,9 @@
     "test": "bun test ./tests/test-*.js"
   },
   "dependencies": {
-    "hono": "^4.13.7"
+    "hono": "^4.13.7",
+    "http-proxy-agent": "^9.1.0",
+    "https-proxy-agent": "^9.1.0",
+    "socks-proxy-agent": "^10.1.0"
   }
 }

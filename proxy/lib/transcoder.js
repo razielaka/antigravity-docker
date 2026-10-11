@@ -5,7 +5,18 @@ const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const { getProxyAgentForUrl } = require('./proxy-agent.js');
 const { THINKING_BUDGETS } = require('./models-manager');
+
+function createStreamRequestOptions(parsed, headers, timeout) {
+    const agent = getProxyAgentForUrl(parsed);
+    return {
+        method: 'POST',
+        headers,
+        timeout,
+        ...(agent ? { agent } : {})
+    };
+}
 
 function isValidConversationId(id) {
     return typeof id === 'string' && id.length > 0 && id.length < 128 && !id.includes('/') && !id.includes('\\') && !id.includes('..') && /^[a-zA-Z0-9_-]+$/.test(id);
@@ -556,8 +567,9 @@ function callAnthropicStream(options) {
     if (apiKey) headers['x-api-key'] = apiKey;
 
     const { promise, safeResolve, safeReject } = createSettledPromise();
+    const reqOptions = createStreamRequestOptions(parsed, headers, requestTimeout);
 
-    const req = transport.request(parsed, { method: 'POST', headers, timeout: requestTimeout }, (res) => {
+    const req = transport.request(parsed, reqOptions, (res) => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
             let errBody = '';
             res.on('data', chunk => errBody += chunk);
@@ -663,7 +675,10 @@ function callAnthropicStream(options) {
         });
 
         res.on('end', () => safeResolve());
-        res.on('error', safeReject);
+        res.on('error', (err) => {
+            safeReject(err);
+            req.destroy(err);
+        });
     });
 
     req.on('timeout', () => {
@@ -956,8 +971,9 @@ function callOpenAIResponsesStream(options) {
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
     const { promise, safeResolve, safeReject } = createSettledPromise();
+    const reqOptions = createStreamRequestOptions(parsed, headers, requestTimeout);
 
-    const req = transport.request(parsed, { method: 'POST', headers, timeout: requestTimeout }, (res) => {
+    const req = transport.request(parsed, reqOptions, (res) => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
             let errBody = '';
             res.on('data', chunk => errBody += chunk);
@@ -1092,7 +1108,10 @@ function callOpenAIResponsesStream(options) {
             }
             safeResolve();
         });
-        res.on('error', safeReject);
+        res.on('error', (err) => {
+            safeReject(err);
+            req.destroy(err);
+        });
     });
 
     req.on('timeout', () => {
@@ -1157,8 +1176,9 @@ function callOpenAIStream(options) {
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
     const { promise, safeResolve, safeReject } = createSettledPromise();
+    const reqOptions = createStreamRequestOptions(parsed, headers, requestTimeout);
 
-    const req = transport.request(parsed, { method: 'POST', headers, timeout: requestTimeout }, (res) => {
+    const req = transport.request(parsed, reqOptions, (res) => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
             let errBody = '';
             res.on('data', chunk => errBody += chunk);
@@ -1284,7 +1304,10 @@ function callOpenAIStream(options) {
         });
 
         res.on('end', () => safeResolve());
-        res.on('error', safeReject);
+        res.on('error', (err) => {
+            safeReject(err);
+            req.destroy(err);
+        });
     });
 
     req.on('timeout', () => {

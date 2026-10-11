@@ -5,6 +5,7 @@ const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
+const { buildRequestOptions } = require('./proxy-agent.js');
 
 const HOME_DIR = process.env.HOME || '/home/developer';
 const GEMINI_CONFIG_DIR = process.env.GEMINI_CONFIG_DIR || path.join(HOME_DIR, '.gemini/config');
@@ -521,7 +522,13 @@ class ModelsManager {
             let byteCount = 0;
             let resolved = false;
 
-            const req = transport.request(parsed, { method: 'GET', headers, timeout: 10000 }, (res) => {
+            const reqOptions = buildRequestOptions(parsed, {
+                method: 'GET',
+                headers,
+                timeout: 10000
+            });
+
+            const req = transport.request(parsed, reqOptions, (res) => {
                 let data = '';
                 res.on('data', (chunk) => {
                     byteCount += chunk.length;
@@ -565,15 +572,28 @@ class ModelsManager {
                         });
                     }
                 });
+                res.on('error', (err) => {
+                    if (!resolved) {
+                        resolved = true;
+                        req.destroy(err);
+                        resolve({ success: false, error: err.message });
+                    }
+                });
             });
 
             req.on('timeout', () => {
-                req.destroy();
-                resolve({ success: false, error: 'Connection timed out after 10 seconds' });
+                if (!resolved) {
+                    resolved = true;
+                    req.destroy();
+                    resolve({ success: false, error: 'Connection timed out after 10 seconds' });
+                }
             });
 
             req.on('error', (err) => {
-                resolve({ success: false, error: err.message });
+                if (!resolved) {
+                    resolved = true;
+                    resolve({ success: false, error: err.message });
+                }
             });
 
             req.end();

@@ -22,6 +22,7 @@ const {
     DEFAULT_SUPPORTED_MIME_TYPES,
     TEXT_ONLY_SUPPORTED_MIME_TYPES
 } = require('./lib/models-manager.js');
+const { buildRequestOptions } = require('./lib/proxy-agent.js');
 
 const DEFAULT_PORT = parseInt(process.env.TRANSLATION_PORT || '4405', 10);
 const DEFAULT_UPSTREAM = process.env.CLOUDCODE_UPSTREAM_URL || 'https://daily-cloudcode-pa.googleapis.com';
@@ -720,11 +721,12 @@ class TranslationProxy {
             headers['accept-encoding'] = 'identity';
             headers['content-length'] = String(rawBodyBuffer.length);
 
-            const proxyReq = client.request(targetUrl, {
+            const reqOptions = buildRequestOptions(targetUrl, {
                 method: req.method,
                 headers,
                 timeout: 30000
-            }, (proxyRes) => {
+            });
+            const proxyReq = client.request(targetUrl, reqOptions, (proxyRes) => {
                 proxyRes.on('error', (err) => {
                     console.error('[Translation Proxy] Upstream response error in fetchAvailableModels:', err.message);
                     proxyReq.destroy(err);
@@ -805,18 +807,32 @@ class TranslationProxy {
             headers['content-length'] = String(rawBodyBuffer.length);
         }
 
-        const proxyReq = client.request(targetUrl, {
+        const reqOptions = buildRequestOptions(targetUrl, {
             method: req.method,
             headers,
-            timeout: 60000
-        }, (proxyRes) => {
+            timeout: 300000
+        });
+        const proxyReq = client.request(targetUrl, reqOptions, (proxyRes) => {
+            if (typeof proxyReq.setTimeout === 'function') {
+                proxyReq.setTimeout(0);
+            }
+            proxyRes.on('error', (err) => {
+                console.error('[Translation Proxy] Upstream response stream error:', err.message);
+                proxyReq.destroy(err);
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Translation Proxy stream error', details: err.message }));
+                } else {
+                    res.destroy(err);
+                }
+            });
             const resHeaders = filterHeaders(proxyRes.headers);
             res.writeHead(proxyRes.statusCode, resHeaders);
             proxyRes.pipe(res);
         });
 
         proxyReq.on('timeout', () => {
-            proxyReq.destroy(new Error('Gateway timeout after 60000ms'));
+            proxyReq.destroy(new Error('Gateway timeout after 300000ms'));
         });
 
         res.on('close', () => {

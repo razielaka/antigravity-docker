@@ -82,10 +82,17 @@ if (sidecarManager && TARGET_PORT) {
     sidecarManager.setLsAddress(`127.0.0.1:${TARGET_PORT}`);
 }
 
+let cachedPatchedMainJs = null;
+let cachedMainJsEtag = null;
+let patchingPromise = null;
+
 function setTargetPort(port) {
     const newPort = parseInt(port, 10);
     if (!newPort || newPort === TARGET_PORT) return;
     TARGET_PORT = newPort;
+    cachedPatchedMainJs = null;
+    cachedMainJsEtag = null;
+    patchingPromise = null;
     console.log(`[Proxy Gateway] 🔗 Bridged port ${LISTEN_PORT} -> http://127.0.0.1:${TARGET_PORT}`);
     if (sidecarManager) {
         sidecarManager.setLsAddress(`127.0.0.1:${TARGET_PORT}`);
@@ -128,8 +135,8 @@ app.use('*', async (c, next) => {
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('X-Frame-Options', 'SAMEORIGIN');
     c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
-    c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    c.header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https:; connect-src 'self' ws: wss:; frame-ancestors 'self';");
+    c.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=()');
+    c.header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://www.gstatic.com https://*.gstatic.com; font-src 'self' https://fonts.gstatic.com https://www.gstatic.com https://*.gstatic.com data:; img-src 'self' data: https:; media-src 'self' blob: data:; connect-src 'self' ws: wss:; frame-ancestors 'self';");
     c.header('X-Accel-Buffering', 'no');
     const isHttps = c.req.header('x-forwarded-proto') === 'https';
     if (isHttps) {
@@ -421,11 +428,87 @@ app.all('/ide/*', (c) => {
     return proxyWebRequest(c, IDE_PORT, strippedPath, { isIde: true });
 });
 
+const WATCHDOG_EXTENDED_TIMEOUT = '45E3'; // 45,000ms per interval (90s total tolerance)
+
+// Dynamic patch & cache for main.js to expand client-side WebSocket liveness watchdog timeout
+async function getPatchedMainJs(targetPort) {
+    if (cachedPatchedMainJs) {
+        return { data: cachedPatchedMainJs, etag: cachedMainJsEtag };
+    }
+    if (patchingPromise) {
+        return patchingPromise;
+    }
+    patchingPromise = (async () => {
+        try {
+            const res = await fetch(`http://127.0.0.1:${targetPort}/main.js`);
+            if (!res.ok) return null;
+            let text = await res.text();
+            let patched = false;
+            const regex = /(Error\("no frames for 4000ms and ping unanswered; closing socket"\)\),[^,]+,[a-zA-Z0-9_$]+\([^)]+\)\)\},)2E3(\)\}else [a-zA-Z0-9_$]+\([^)]+\)\},\s*)2E3/;
+            if (regex.test(text)) {
+                text = text.replace(regex, `$1 ${WATCHDOG_EXTENDED_TIMEOUT}$2 ${WATCHDOG_EXTENDED_TIMEOUT}`);
+                console.log('[Proxy Gateway] ⚡ Successfully patched main.js client-side WebSocket liveness watchdog (4s -> 90s)');
+                patched = true;
+            } else {
+                console.warn('[Proxy Gateway] ⚠️ main.js watchdog pattern did not match upstream bundle; passing through unpatched');
+            }
+
+            const ghostTextTarget = 'console.warn(`Unknown node type: ${a.type}`);return null';
+            if (text.includes(ghostTextTarget)) {
+                text = text.replace(ghostTextTarget, 'if(a.type==="ghost-text")return null;console.warn(`Unknown node type: ${a.type}`);return null');
+                console.log('[Proxy Gateway] ⚡ Successfully patched main.js ghost-text serialization warning');
+                patched = true;
+            }
+
+            if (patched) {
+                cachedPatchedMainJs = Buffer.from(text, 'utf8');
+                cachedMainJsEtag = `W/"patched-${crypto.createHash('md5').update(cachedPatchedMainJs).digest('hex').slice(0, 16)}"`;
+                return { data: cachedPatchedMainJs, etag: cachedMainJsEtag };
+            }
+            return null;
+        } catch (e) {
+            return null;
+        } finally {
+            patchingPromise = null;
+        }
+    })();
+    return patchingPromise;
+}
+
+app.get('/main.js', async (c) => {
+    if (!TARGET_PORT) return c.text('Upstream not ready', 503);
+    const patched = await getPatchedMainJs(TARGET_PORT);
+    if (!patched) {
+        return proxyWebRequest(c, TARGET_PORT, '/main.js', { isUpstream: true });
+    }
+    const clientEtag = c.req.header('if-none-match');
+    if (clientEtag === patched.etag) {
+        return new Response(null, {
+            status: 304,
+            headers: {
+                'ETag': patched.etag,
+                'Cache-Control': 'no-cache',
+                'Vary': 'Accept-Encoding'
+            }
+        });
+    }
+    return new Response(patched.data, {
+        status: 200,
+        headers: {
+            'Content-Type': 'text/javascript; charset=utf-8',
+            'Content-Length': String(patched.data.length),
+            'ETag': patched.etag,
+            'Cache-Control': 'no-cache',
+            'Vary': 'Accept-Encoding'
+        }
+    });
+});
+
 // SPA check & Upstream Antigravity Hub proxy
 app.all('*', (c) => {
     const pathname = c.req.path;
     if (c.req.method === 'GET' && isSpaRoute(pathname)) {
-        if (c.req.query('useWebSocket') !== 'true') {
+        if (c.req.query('useWebSocket') === undefined) {
             const url = new URL(c.req.raw.url);
             url.searchParams.set('useWebSocket', 'true');
             return c.redirect(url.pathname + url.search, 302);
@@ -469,6 +552,13 @@ if (shouldStartTranslation) {
     translationProxy.start().catch(err => {
         console.error('[Proxy Gateway] Warning: Translation Proxy failed to start:', err.message);
     });
+}
+
+function cleanupHeartbeat(ws) {
+    if (ws?.data?.heartbeatTimer) {
+        clearInterval(ws.data.heartbeatTimer);
+        ws.data.heartbeatTimer = null;
+    }
 }
 
 const server = Bun.serve({
@@ -520,6 +610,9 @@ const server = Bun.serve({
         return app.fetch(req, { server });
     },
     websocket: {
+        maxPayloadLength: 128 * 1024 * 1024,
+        backpressureLimit: 128 * 1024 * 1024,
+        closeOnBackpressureLimit: true,
         open(ws) {
             const { wsTargetPort, wsTargetPath, headers } = ws.data;
             const targetUrl = `ws://127.0.0.1:${wsTargetPort}${wsTargetPath}`;
@@ -546,12 +639,29 @@ const server = Bun.serve({
                 ws.data.pendingMessages = [];
                 if (isConnectWs) {
                     ws.data.activeStreams = new Map();
+                    // Proactive WebSocket heartbeat to satisfy client liveness probe (main.js sJ probe)
+                    // During large uploads (like images/recordings), full-duplex downstream frames keep the probe alive.
+                    ws.data.heartbeatTimer = setInterval(() => {
+                        try {
+                            if (ws.readyState === 1 /* WebSocket.OPEN */) {
+                                ws.send(JSON.stringify({ type: 'heartbeat' }));
+                            } else {
+                                cleanupHeartbeat(ws);
+                            }
+                        } catch (e) {
+                            cleanupHeartbeat(ws);
+                        }
+                    }, 1000);
                 }
 
                 upstreamWs.onopen = () => {
                     if (ws.data.pendingMessages && ws.data.pendingMessages.length > 0) {
                         for (const msg of ws.data.pendingMessages) {
-                            upstreamWs.send(msg);
+                            try {
+                                upstreamWs.send(msg);
+                            } catch (e) {
+                                console.error('[WebSocket Upstream Pending Send Error]', e.message);
+                            }
                         }
                         ws.data.pendingMessages = null;
                     }
@@ -569,15 +679,20 @@ const server = Bun.serve({
                     }
                 };
 
-                upstreamWs.onclose = () => {
+                const teardownBridge = (reason, err) => {
+                    if (err) {
+                        console.error(`[WebSocket Bridge] Upstream ${reason}:`, err.message || err);
+                    }
+                    cleanupHeartbeat(ws);
                     ws.data?.activeStreams?.clear();
+                    if (ws.data?.pendingMessages) {
+                        ws.data.pendingMessages.length = 0;
+                    }
                     try { ws.close(); } catch (e) {}
                 };
 
-                upstreamWs.onerror = () => {
-                    ws.data?.activeStreams?.clear();
-                    try { ws.close(); } catch (e) {}
-                };
+                upstreamWs.onclose = () => teardownBridge('closed');
+                upstreamWs.onerror = (err) => teardownBridge('error', err);
             } catch (err) {
                 console.error('[WebSocket Bridge Error]', err.message);
                 ws.close();
@@ -588,16 +703,30 @@ const server = Bun.serve({
             if (ws.data?.activeStreams) {
                 processedMessage = handleWebSocketClientMessage(ws, message, modelsManager, activeConversationModels);
             }
+            if (!processedMessage) return;
 
             const upstreamWs = ws.data?.upstreamWs;
             if (upstreamWs && upstreamWs.readyState === WebSocket.OPEN) {
-                upstreamWs.send(processedMessage);
+                try {
+                    upstreamWs.send(processedMessage);
+                } catch (sendErr) {
+                    console.error('[WebSocket Upstream Send Error]', sendErr.message);
+                }
             } else if (ws.data?.pendingMessages) {
-                ws.data.pendingMessages.push(processedMessage);
+                const MAX_PENDING_WS_MESSAGES = 100;
+                if (ws.data.pendingMessages.length < MAX_PENDING_WS_MESSAGES) {
+                    ws.data.pendingMessages.push(processedMessage);
+                } else {
+                    console.warn('[WebSocket Bridge] Pending message queue full while waiting for upstream; dropping message');
+                }
             }
         },
         close(ws) {
+            cleanupHeartbeat(ws);
             ws.data?.activeStreams?.clear();
+            if (ws.data?.pendingMessages) {
+                ws.data.pendingMessages.length = 0;
+            }
             if (ws.data?.upstreamWs) {
                 try { ws.data.upstreamWs.close(); } catch (e) {}
             }
